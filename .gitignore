@@ -1,2 +1,5 @@
 fine-tuned-models/
 sustainability_embedding_model/
+SusReport/finetuned_qa_model/
+myenv/
+pdf_process/
