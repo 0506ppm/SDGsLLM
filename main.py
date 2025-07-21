@@ -27,7 +27,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # === 載入 RAG 模型 ===
 print("\U0001F680 載入 LLM 模型中...")
-lora_model_path = "./output/not_finetuned_mistral7b-lora"
+lora_model_path = "./output/result_mistral7b-lora"
 base_model_path = PeftConfig.from_pretrained(lora_model_path).base_model_name_or_path
 
 tokenizer = AutoTokenizer.from_pretrained(base_model_path)
@@ -76,14 +76,28 @@ embedding_model.load_state_dict(torch.load(os.path.join(model_dir, "embedding_he
 embedding_model = embedding_model.to(device).eval()
 
 # === MongoDB 與 FAISS ===
-mongo_client = MongoClient("mongodb+srv://0506ppm:tt920506@cluster0.ozc6lzs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+mongo_client = MongoClient("mongodb+srv://0506ppm:<db_password>@cluster0.ozc6lzs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 collection = mongo_client["vector_db"]["paragraphs"]
 
 faiss_index_path = os.path.join(faiss_dir, "faiss_index.index")
 faiss_ids_path = os.path.join(faiss_dir, "faiss_ids.json")
-index = faiss.read_index(faiss_index_path) if os.path.exists(faiss_index_path) else None
-with open(faiss_ids_path, "r") as f:
-    paragraph_ids = json.load(f) if os.path.exists(faiss_ids_path) else []
+
+if os.path.exists(faiss_index_path):
+    try:
+        index = faiss.read_index(faiss_index_path)
+    except Exception as e:
+        print("❌ 讀取 FAISS 索引失敗：", e)
+        index = None
+else:
+    index = None
+
+
+if os.path.exists(faiss_ids_path):
+    with open(faiss_ids_path, "r") as f:
+        paragraph_ids = json.load(f)
+else:
+    paragraph_ids = []
+
 
 label_map = {0: "初級做法", 1: "進階做法", 2: "領先做法"}
 
@@ -92,25 +106,60 @@ class QueryRequest(BaseModel):
 
 @app.post("/chat")
 def chat(req: QueryRequest):
-    prompt = f"請根據以下問題給出正確答案：\n問題：{req.message}"
+    prompt = f"""你是一位 ESG 永續報告分析師，請直接針對以下問題清楚簡短地回答，不要產生額外問題：
+問題：{req.message}
+回答："""
+    
     result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
-    return {"reply": result}
+
+    # 只取第一個「回答」段落
+    if "回答：" in result:
+        answer = result.split("回答：")[-1].split("問題：")[0].strip()
+    else:
+        answer = result.strip()
+
+    return {"reply": answer}
 
 @app.post("/rag_chat")
 def rag_chat(req: QueryRequest):
+    # Step 1：將 query 轉為向量
     query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
+
+    # Step 2：使用 FAISS 搜尋前 3 筆段落
     D, I = index.search(query_vec, 3)
     retrieved_texts = []
+    context_snippets = []
+
     for idx in I[0]:
         para_id = paragraph_ids[idx]
         doc = collection.find_one({"_id": para_id})
         if doc:
             label = label_map.get(doc.get("label", -1), "未標記")
-            retrieved_texts.append(f"[{label}] {doc['text']}")
-    context = "\n".join(retrieved_texts)
-    prompt = f"""請根據以下參考資料回答問題：\n\n參考資料：\n{context}\n\n問題：{req.message}\n請根據資料清楚回答問題，如果找不到答案請說明。"""
+            para_text = doc['text']
+            context_snippets.append(f"[{label}] {para_text}")
+            retrieved_texts.append({
+                "id": para_id,
+                "label": label,
+                "text": para_text
+            })
+
+    # Step 3：構建 prompt 並產生回覆
+    context = "\n\n".join(context_snippets)
+    prompt = f"""你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。\n\n參考資料：\n{context}\n\n問題：{req.message}\n回答："""
+
     result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
-    return {"reply": result, "context": context}
+
+    # Step 4：清洗回答
+    if "回答：" in result:
+        answer = result.split("回答：")[-1].split("問題：")[0].strip()
+    else:
+        answer = result.strip()
+
+    return {
+        "reply": answer,
+        "references": retrieved_texts
+    }
+
 
 class DocumentProcessor:
     def __init__(self):
@@ -222,9 +271,19 @@ async def upload_document(file: UploadFile = File(...)):
     faiss.write_index(index, faiss_index_path)
     with open(faiss_ids_path, "w") as f:
         json.dump(paragraph_ids, f)
+    
+        # ✅ 取前 3 段當作 preview
+    preview_texts = paragraphs[:3]
 
-    return {"message": "✅ 文件已向量化", "paragraphs": len(paragraphs), "dimension": new_embeddings.shape[1]}
+    return {
+        "message": "✅ 文件已向量化",
+        "paragraphs": len(paragraphs),
+        "dimension": new_embeddings.shape[1],
+        "preview": preview_texts,
+        "new_faiss_added": len(new_ids)
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8888)
+    uvicorn.run(app, host="0.0.0.0", port=5000)
