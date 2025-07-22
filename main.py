@@ -129,19 +129,32 @@ def rag_chat(req: QueryRequest):
     D, I = index.search(query_vec, 3)
     retrieved_texts = []
     context_snippets = []
+    
+    # FAISS 搜尋出前3個最相關段落的 MongoDB ID
+    top_ids = [paragraph_ids[idx] for idx in I[0]]
 
-    for idx in I[0]:
-        para_id = paragraph_ids[idx]
-        doc = collection.find_one({"_id": para_id})
-        if doc:
-            label = label_map.get(doc.get("label", -1), "未標記")
-            para_text = doc['text']
-            context_snippets.append(f"[{label}] {para_text}")
-            retrieved_texts.append({
-                "id": para_id,
-                "label": label,
-                "text": para_text
-            })
+    # 呼叫本機 FastAPI，請它幫我們查 MongoDB
+    try:
+        response = requests.post(
+            "http://<你的本機 IP>:8000/get_docs",
+            json={"ids": top_ids},
+            timeout=10
+        )
+        documents = response.json()
+    except Exception as e:
+        return {"reply": f"❌ 無法從本機 API 獲取段落：{str(e)}", "references": []}
+
+    # 重建段落 + label
+    for doc in documents:
+        label = label_map.get(doc.get("label", -1), "未標記")
+        para_text = doc['text']
+        context_snippets.append(f"[{label}] {para_text}")
+        retrieved_texts.append({
+            "id": doc["_id"],
+            "label": label,
+            "text": para_text
+        })
+
 
     # Step 3：構建 prompt 並產生回覆
     context = "\n\n".join(context_snippets)
