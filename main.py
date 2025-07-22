@@ -76,7 +76,7 @@ embedding_model.load_state_dict(torch.load(os.path.join(model_dir, "embedding_he
 embedding_model = embedding_model.to(device).eval()
 
 # === MongoDB 與 FAISS ===
-mongo_client = MongoClient("mongodb+srv://0506ppm:<db_password>@cluster0.ozc6lzs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+mongo_client = MongoClient("mongodb+srv://0506ppm:tt920506@cluster0.ozc6lzs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 collection = mongo_client["vector_db"]["paragraphs"]
 
 faiss_index_path = os.path.join(faiss_dir, "faiss_index.index")

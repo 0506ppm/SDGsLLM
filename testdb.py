@@ -1,7 +1,7 @@
 from pymongo import MongoClient
 
 try:
-    uri = "mongodb+srv://0506ppm:<db_password>@cluster0.ozc6lzs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    uri = "mongodb+srv://0506ppm:tt920506@cluster0.ozc6lzs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
     client = MongoClient(uri)
     dbs = client.list_database_names()
     print("✅ 成功連線，資料庫列表：", dbs)
