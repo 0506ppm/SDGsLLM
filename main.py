@@ -1,9 +1,9 @@
+# ✅ main.py（TWCC）
 from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, AutoModel
 from peft import PeftModel, PeftConfig
 from pyngrok import ngrok, conf
-from pymongo import MongoClient
 import torch
 import faiss
 import json
@@ -16,12 +16,14 @@ import fitz  # PyMuPDF
 import docx
 from tika import parser
 import tika
+import requests
 
 # 初始化 Tika
 tika.initVM()
 
+local_api = "https://6e5b9d1ec91e.ngrok-free.app"
 # === Ngrok 設定 ===
-conf.get_default().auth_token = "2zdWETPLyoPte8AydDb2uyo2aHi_3FZCs9z9EPoaB8W1v1nGo"
+conf.get_default().auth_token = "30GlQy4n4ri3sbqPuLQMjbFELlr_7aWLtdRFWrevtcawL29XX"
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -75,10 +77,7 @@ embedding_model = EmbeddingModel(embedding_base_model, embedding_tokenizer)
 embedding_model.load_state_dict(torch.load(os.path.join(model_dir, "embedding_head.pt"), map_location=device), strict=False)
 embedding_model = embedding_model.to(device).eval()
 
-# === MongoDB 與 FAISS ===
-mongo_client = MongoClient("mongodb+srv://0506ppm:tt920506@cluster0.ozc6lzs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-collection = mongo_client["vector_db"]["paragraphs"]
-
+# === FAISS ===
 faiss_index_path = os.path.join(faiss_dir, "faiss_index.index")
 faiss_ids_path = os.path.join(faiss_dir, "faiss_ids.json")
 
@@ -91,13 +90,11 @@ if os.path.exists(faiss_index_path):
 else:
     index = None
 
-
 if os.path.exists(faiss_ids_path):
     with open(faiss_ids_path, "r") as f:
         paragraph_ids = json.load(f)
 else:
     paragraph_ids = []
-
 
 label_map = {0: "初級做法", 1: "進階做法", 2: "領先做法"}
 
@@ -106,72 +103,41 @@ class QueryRequest(BaseModel):
 
 @app.post("/chat")
 def chat(req: QueryRequest):
-    prompt = f"""你是一位 ESG 永續報告分析師，請直接針對以下問題清楚簡短地回答，不要產生額外問題：
-問題：{req.message}
-回答："""
-    
+    prompt = f"""你是一位 ESG 永續報告分析師，請直接針對以下問題清楚簡短地回答，不要產生額外問題：\n問題：{req.message}\n回答："""
     result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
-
-    # 只取第一個「回答」段落
-    if "回答：" in result:
-        answer = result.split("回答：")[-1].split("問題：")[0].strip()
-    else:
-        answer = result.strip()
-
+    answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
     return {"reply": answer}
 
 @app.post("/rag_chat")
 def rag_chat(req: QueryRequest):
-    # Step 1：將 query 轉為向量
     query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
-
-    # Step 2：使用 FAISS 搜尋前 3 筆段落
     D, I = index.search(query_vec, 3)
-    retrieved_texts = []
-    context_snippets = []
-    
-    # FAISS 搜尋出前3個最相關段落的 MongoDB ID
-    top_ids = [paragraph_ids[idx] for idx in I[0]]
 
-    # 呼叫本機 FastAPI，請它幫我們查 MongoDB
+    # 印出取得的索引位置與對應的 Mongo _id
+    print("🔍 FAISS 找到的向量 ID 索引：", I)
+    top_ids = [paragraph_ids[idx] for idx in I[0]]
+    print("🧾 FAISS 找到的 MongoDB _id：", top_ids)
+
+    # 向本機 API 請求原文
     try:
-        response = requests.post(
-            "http://<你的本機 IP>:8000/get_docs",
-            json={"ids": top_ids},
-            timeout=10
-        )
+        response = requests.post(f"{local_api}/get_docs", json={"ids": top_ids}, timeout=10)
         documents = response.json()
+        if isinstance(documents, dict) and "error" in documents:
+            return {"reply": f"❌ 本機 API 回傳錯誤：{documents['error']}", "references": []}
+        print("📚 取得 documents：", documents)
     except Exception as e:
         return {"reply": f"❌ 無法從本機 API 獲取段落：{str(e)}", "references": []}
 
-    # 重建段落 + label
-    for doc in documents:
-        label = label_map.get(doc.get("label", -1), "未標記")
-        para_text = doc['text']
-        context_snippets.append(f"[{label}] {para_text}")
-        retrieved_texts.append({
-            "id": doc["_id"],
-            "label": label,
-            "text": para_text
-        })
+    if not documents:
+        return {"reply": "❌ 沒有找到任何相關段落。", "references": []}
 
-
-    # Step 3：構建 prompt 並產生回覆
-    context = "\n\n".join(context_snippets)
-    prompt = f"""你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。\n\n參考資料：\n{context}\n\n問題：{req.message}\n回答："""
-
+    # 建立 context
+    context_snippets = [f"[{label_map.get(doc.get('label', -1), '未標記')}] {doc['text']}" for doc in documents]
+    prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
     result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
+    answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
 
-    # Step 4：清洗回答
-    if "回答：" in result:
-        answer = result.split("回答：")[-1].split("問題：")[0].strip()
-    else:
-        answer = result.strip()
-
-    return {
-        "reply": answer,
-        "references": retrieved_texts
-    }
+    return {"reply": answer, "references": documents}
 
 
 class DocumentProcessor:
@@ -182,7 +148,6 @@ class DocumentProcessor:
             '.doc': self._extract_doc,
             '.txt': self._extract_txt
         }
-
     def _extract_pdf(self, file_path):
         try:
             doc = fitz.open(file_path)
@@ -192,7 +157,6 @@ class DocumentProcessor:
         except Exception as e:
             print(f"PDF處理錯誤 {file_path}: {e}")
             return ""
-
     def _extract_docx(self, file_path):
         try:
             doc = docx.Document(file_path)
@@ -200,7 +164,6 @@ class DocumentProcessor:
         except Exception as e:
             print(f"DOCX處理錯誤 {file_path}: {e}")
             return ""
-
     def _extract_doc(self, file_path):
         try:
             parsed = parser.from_file(file_path)
@@ -208,7 +171,6 @@ class DocumentProcessor:
         except Exception as e:
             print(f"DOC處理錯誤 {file_path}: {e}")
             return ""
-
     def _extract_txt(self, file_path):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -216,15 +178,10 @@ class DocumentProcessor:
         except Exception as e:
             print(f"TXT處理錯誤 {file_path}: {e}")
             return ""
-
     def extract_text(self, file_path):
         ext = os.path.splitext(file_path)[1].lower()
         extractor = self.extractors.get(ext)
-        if extractor:
-            return extractor(file_path)
-        else:
-            print(f"不支援的檔案類型: {ext}")
-            return ""
+        return extractor(file_path) if extractor else ""
 
 @app.post("/upload-document")
 async def upload_document(file: UploadFile = File(...)):
@@ -237,7 +194,6 @@ async def upload_document(file: UploadFile = File(...)):
     processor = DocumentProcessor()
     text = processor.extract_text(file_path)
     os.remove(file_path)
-
     if not text.strip():
         return {"error": "❌ 檔案無法擷取文字內容"}
 
@@ -260,8 +216,7 @@ async def upload_document(file: UploadFile = File(...)):
         embeddings.append(emb)
         para_id = str(uuid.uuid4())
         new_ids.append(para_id)
-
-        collection.insert_one({
+        doc = {
             "_id": para_id,
             "text": para,
             "category": label["category"],
@@ -273,7 +228,12 @@ async def upload_document(file: UploadFile = File(...)):
                 "length": len(para),
                 "chunk_index": label["chunk_id"]
             }
-        })
+        }
+        try:
+            res = requests.post(f"https://{local_api}/insert_doc", json=doc, timeout=10)
+            res.raise_for_status()
+        except Exception as e:
+            print("❌ 本機插入 MongoDB 失敗：", e)
 
     new_embeddings = np.vstack(embeddings)
     if index is None:
@@ -284,19 +244,16 @@ async def upload_document(file: UploadFile = File(...)):
     faiss.write_index(index, faiss_index_path)
     with open(faiss_ids_path, "w") as f:
         json.dump(paragraph_ids, f)
-    
-        # ✅ 取前 3 段當作 preview
-    preview_texts = paragraphs[:3]
 
     return {
         "message": "✅ 文件已向量化",
         "paragraphs": len(paragraphs),
         "dimension": new_embeddings.shape[1],
-        "preview": preview_texts,
+        "preview": paragraphs[:3],
         "new_faiss_added": len(new_ids)
     }
-
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=5000)
+
