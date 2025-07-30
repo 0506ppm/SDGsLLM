@@ -1,7 +1,10 @@
 from pyngrok import ngrok, conf
+import os
+
+load_dotenv()  # 預設會找 .env 檔案
 
 # ✅ 輸入你自己的 ngrok token
-conf.get_default().auth_token = "30GlQy4n4ri3sbqPuLQMjbFELlr_7aWLtdRFWrevtcawL29XX"
+conf.get_default().auth_token = os.getenv("NGROK_TOKEN")
 
 # ✅ 開啟 8000 port
 public_url = ngrok.connect(8000)

@@ -3,10 +3,10 @@ from pymongo import MongoClient
 import os
 
 app = Flask(__name__)
+load_dotenv()  # 預設會找 .env 檔案
 
 # ✅ 使用 Atlas MongoDB URI
-client = MongoClient("mongodb+srv://0506ppm:tt920506@cluster0.ozc6lzs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-
+client = MongoClient(os.getenv("API_KEY"))
 # ✅ 指定資料庫與集合
 db = client["SDGs"]
 collection = db["documents"]
