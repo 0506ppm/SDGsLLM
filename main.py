@@ -99,7 +99,7 @@ if os.path.exists(faiss_ids_path):
 else:
     paragraph_ids = []
 
-label_map = {0: "初級做法", 1: "進階做法", 2: "領先做法"}
+#（已經不用）label_map = {0: "初級做法", 1: "進階做法", 2: "領先做法"}
 
 class QueryRequest(BaseModel):
     message: str
@@ -135,7 +135,7 @@ def rag_chat(req: QueryRequest):
         return {"reply": "❌ 沒有找到任何相關段落。", "references": []}
 
     # 建立 context
-    context_snippets = [f"[{label_map.get(doc.get('label', -1), '未標記')}] {doc['text']}" for doc in documents]
+    context_snippets = [doc['text'] for doc in documents]
     prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
     result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
     answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()

@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
+from dotenv import load_dotenv
 import os
-
 app = Flask(__name__)
 load_dotenv()  # 預設會找 .env 檔案
 
