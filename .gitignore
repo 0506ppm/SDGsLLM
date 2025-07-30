@@ -1,5 +1,6 @@
 # 模型與輸出資料夾
 fine-tuned-models/
+sustainability_embedding_model*
 sustainability_embedding_model/
 SusReport/finetuned_qa_model/
 output/

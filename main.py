@@ -77,7 +77,7 @@ class EmbeddingModel(torch.nn.Module):
             return self.get_embeddings(inputs['input_ids'], inputs['attention_mask'])
 
 embedding_model = EmbeddingModel(embedding_base_model, embedding_tokenizer)
-embedding_model.load_state_dict(torch.load(os.path.join(model_dir, "embedding_head.pt"), map_location=device), strict=False)
+embedding_model.load_state_dict(torch.load(os.path.join(model_dir, "model_weights.pt"), map_location=device), strict=False)
 embedding_model = embedding_model.to(device).eval()
 
 # === FAISS ===
