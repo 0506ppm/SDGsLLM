@@ -1,9 +1,10 @@
 from pyngrok import ngrok, conf
 from dotenv import load_dotenv
+from pathlib import Path
 import time
 import os
 
-load_dotenv()  # 預設會找 .env 檔案
+load_dotenv(dotenv_path=Path("/Users/chenjiaxiang/SDGsLLM/.env"))
 
 # ✅ 輸入你自己的 ngrok token
 conf.get_default().auth_token = os.getenv("NGROK_TOKEN")

@@ -1,15 +1,17 @@
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from dotenv import load_dotenv
+from pathlib import Path
 import os
+
 app = Flask(__name__)
-load_dotenv()  # 預設會找 .env 檔案
+load_dotenv(dotenv_path=Path("/Users/chenjiaxiang/SDGsLLM/.env"))  # 預設會找 .env 檔案
 
 # ✅ 使用 Atlas MongoDB URI
-client = MongoClient(os.getenv("API_KEY"))
+client = MongoClient(os.getenv("MONGO_URI"))
 # ✅ 指定資料庫與集合
-db = client["SDGs"]
-collection = db["documents"]
+db = client["vector_db"]
+collection = db["paragraphs"]
 
 @app.route("/ping", methods=["GET"])
 def ping():
