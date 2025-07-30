@@ -17,13 +17,16 @@ import docx
 from tika import parser
 import tika
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # 初始化 Tika
 tika.initVM()
 
-local_api = "https://6e5b9d1ec91e.ngrok-free.app"
+local_api = os.getenv("LOCAL_API")
 # === Ngrok 設定 ===
-conf.get_default().auth_token = "30GlQy4n4ri3sbqPuLQMjbFELlr_7aWLtdRFWrevtcawL29XX"
+conf.get_default().auth_token = os.getenv("NGROK_TOKEN")
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
