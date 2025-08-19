@@ -8,6 +8,7 @@ offload/
 
 # 暫存與中間資料
 pdf_process/
+temp_downloads/
 core.1807
 *.core
 
