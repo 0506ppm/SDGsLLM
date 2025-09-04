@@ -19,6 +19,7 @@ import tika
 import requests
 from dotenv import load_dotenv
 import re  # 新增：用於文字清理
+from groq import Groq  # 新增：Groq API
 
 load_dotenv()
 
@@ -26,6 +27,10 @@ load_dotenv()
 tika.initVM()
 
 local_api = os.getenv("LOCAL_API")
+groq_api_key = os.getenv("GROQ_API_KEY")
+
+# 初始化 Groq 客戶端
+groq_client = Groq(api_key=groq_api_key)
 # === Ngrok 設定 ===
 conf.get_default().auth_token = os.getenv("NGROK_TOKEN")
 app = FastAPI()
@@ -558,6 +563,129 @@ def rag_chat(req: QueryRequest):
 
     return {"reply": answer, "references": documents}
 
+@app.post("/gpt_chat")
+def gpt_chat(req: QueryRequest):
+    """
+    使用 RAG 檢索相關文件，然後透過 Groq API 回答問題
+    """
+    # 檢查 Groq API Key
+    if not groq_api_key:
+        return {"error": "⚠ GROQ_API_KEY 未設定", "references": []}
+    
+    # 檢查 FAISS 索引是否存在
+    if index is None:
+        return {"reply": "⚠ FAISS 索引尚未初始化，請先上傳文件。", "references": []}
+    
+    try:
+        # === RAG 檢索階段 ===
+        query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
+        D, I = index.search(query_vec, 5)  # 獲取更多相關文檔
+
+        print("🔍 FAISS 找到的向量 ID 索引：", I)
+        top_ids = [paragraph_ids[idx] for idx in I[0] if idx < len(paragraph_ids)]
+        print("🧾 FAISS 找到的 MongoDB _id：", top_ids)
+
+        if not top_ids:
+            # 如果沒有找到相關文檔，直接使用 Groq 回答
+            try:
+                completion = groq_client.chat.completions.create(
+                    model="openai/gpt-oss-120b",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "你是一位專業的 ESG 永續報告分析師。請根據你的專業知識回答用戶的問題。如果問題超出你的知識範圍，請誠實說明。"
+                        },
+                        {
+                            "role": "user",
+                            "content": req.message
+                        }
+                    ],
+                    temperature=0.7,
+                    max_completion_tokens=1000,
+                    top_p=1,
+                    reasoning_effort="medium",
+                    stream=False,
+                    stop=None
+                )
+                
+                answer = completion.choices[0].message.content
+                return {"reply": answer, "references": [], "note": "基於一般知識回答（未找到相關文檔）"}
+            
+            except Exception as e:
+                return {"error": f"⚠ Groq API 調用失敗：{str(e)}", "references": []}
+
+        # === 獲取相關文檔 ===
+        try:
+            api_url = local_api if local_api.startswith('http') else f"https://{local_api}"
+            response = requests.post(f"{api_url}/get_docs", json={"ids": top_ids}, timeout=10)
+            documents = response.json()
+            
+            if isinstance(documents, dict) and "error" in documents:
+                return {"reply": f"⚠ 本機 API 回傳錯誤：{documents['error']}", "references": []}
+            
+            print("📚 取得 documents：", len(documents))
+            
+        except Exception as e:
+            return {"error": f"⚠ 無法從本機 API 獲取段落：{str(e)}", "references": []}
+
+        if not documents:
+            return {"error": "⚠ 沒有找到任何相關段落。", "references": []}
+
+        # === 準備上下文並呼叫 Groq API ===
+        context_snippets = [doc['text'] for doc in documents]
+        context_text = "\n\n".join(context_snippets)
+        
+        # 限制上下文長度避免超過 token 限制
+        if len(context_text) > 4000:  # 預留給問題和系統提示的空間
+            context_text = context_text[:4000] + "..."
+        
+        try:
+            completion = groq_client.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """你是一位專業的 ESG 永續報告分析師。請根據提供的參考資料回答用戶的問題。
+
+回答要求：
+1. 主要依據提供的參考資料回答
+2. 如果參考資料中沒有相關資訊，請明確說明
+3. 回答要準確、專業且易懂
+4. 如果可能，請引用具體的數據或事實"""
+                    },
+                    {
+                        "role": "user", 
+                        "content": f"""參考資料：
+{context_text}
+
+問題：{req.message}
+
+請根據以上參考資料回答問題。"""
+                    }
+                ],
+                temperature=0.7,
+                max_completion_tokens=1000,
+                top_p=1,
+                reasoning_effort="medium",
+                stream=False,
+                stop=None
+            )
+            
+            answer = completion.choices[0].message.content
+            
+            return {
+                "reply": answer,
+                "references": documents,
+                "note": "基於文檔內容 + Groq GPT 回答"
+            }
+            
+        except Exception as e:
+            return {"error": f"⚠ Groq API 調用失敗：{str(e)}", "references": documents}
+    
+    except Exception as e:
+        print(f"gpt_chat 發生錯誤: {e}")
+        return {"error": f"⚠ 處理請求時發生錯誤：{str(e)}", "references": []}
+
 # === 上傳端點（原有的檔案上傳功能）===
 @app.post("/upload-document")
 async def upload_document(file: UploadFile = File(...)):
@@ -607,15 +735,15 @@ async def upload_documents(req: UploadDocumentRequest):
     從 URL 下載文件並進行向量化處理
     """
     print(f"📤 收到文件處理請求: {req.file_name} from {req.file_url}")
-    
+
     # 驗證檔案名稱
     if not req.file_name:
         return {"error": "⚠ 檔案名稱為空"}
-    
+
     # 驗證 URL
     if not req.file_url or not req.file_url.startswith(('http://', 'https://')):
         return {"error": "⚠ 無效的檔案 URL"}
-    
+
     # 檢查檔案副檔名
     ext = os.path.splitext(req.file_name)[1].lower()
     supported_formats = ['.pdf', '.docx', '.doc', '.txt']
@@ -624,47 +752,99 @@ async def upload_documents(req: UploadDocumentRequest):
             "error": f"⚠ 不支援的檔案格式 '{ext}'",
             "supported_formats": supported_formats
         }
-    
+
     # 建立臨時目錄
     temp_dir = "./temp_downloads"
     os.makedirs(temp_dir, exist_ok=True)
-    
+
     # 生成唯一的本機檔案路徑
     unique_id = str(uuid.uuid4())[:8]
     safe_filename = f"{unique_id}_{req.file_name}"
     local_file_path = os.path.join(temp_dir, safe_filename)
-    
-    # 下載檔案
-    if not download_file(req.file_url, local_file_path):
-        return {"error": "⚠ 檔案下載失敗"}
-        
-    # 處理文件
-    processor = DocumentProcessor()
-    text = processor.extract_text(local_file_path)
-        
-    if not text or not text.strip():
+
+    try:
+        # 下載檔案
+        if not download_file(req.file_url, local_file_path):
+            return {"error": "⚠ 檔案下載失敗"}
+
+        # 處理文件
+        processor = DocumentProcessor()
+        text = processor.extract_text(local_file_path)
+
+        if not text or not text.strip():
+            return {
+                "error": "⚠ 檔案無法擷取文字內容",
+                "file_name": req.file_name,
+                "possible_reasons": [
+                    "檔案可能是掃描的圖片 PDF（需要 OCR）",
+                    "檔案內容為空或損壞",
+                    "檔案格式不正確",
+                    "檔案使用不支援的編碼",
+                    "檔案包含太多無意義的內容（已被過濾）"
+                ]
+            }
+
+        # 處理向量化
+        paragraphs_count, dimension, preview, new_faiss_added = process_document_to_vectors(
+            text, req.file_name, req.file_url
+        )
+
         return {
-            "error": "⚠ 檔案無法擷取文字內容",
+            "message": "✅ 文件已成功處理並向量化",
             "file_name": req.file_name,
-            "possible_reasons": [
-                "檔案可能是掃描的圖片 PDF（需要 OCR）",
-                "檔案內容為空或損壞",
-                "檔案格式不正確",
-                "檔案使用不支援的編碼",
-                "檔案包含太多無意義的內容（已被過濾）"
-            ]
+            "source_url": req.file_url,
+            "paragraphs": paragraphs_count,
+            "dimension": dimension,
+            "preview": preview,
+            "new_faiss_added": new_faiss_added,
+            "text_length": len(text),
+            "chunks_processed": paragraphs_count
         }
-        
-    # 處理向量化
-    paragraphs_count, dimension, preview, new_faiss_added = process_document_to_vectors(
-        text, req.file_name, req.file_url
-    )
+
+    except Exception as e:
+        print(f"⚠ 處理檔案時發生錯誤: {e}")
+        return {
+            "error": f"⚠ 檔案處理失敗: {str(e)}",
+            "file_name": req.file_name
+        }
+
+    finally:
+        # 清理臨時檔案
+        try:
+            if os.path.exists(local_file_path):
+                os.remove(local_file_path)
+                print(f"🗑️ 已清理臨時檔案: {local_file_path}")
+        except Exception as e:
+            print(f"⚠️ 清理臨時檔案失敗: {e}")
+
+# === 批次處理端點 ===
+@app.post("/upload_documents_batch")
+async def upload_documents_batch(req: BatchUploadRequest):
+    """
+    批次處理多個文件
+    """
+    results = []
+
+    for file_info in req.files:
+        try:
+            file_req = UploadDocumentRequest(**file_info)
+            result = await upload_documents(file_req)
+            results.append({
+                "file_name": file_info.get("file_name"),
+                "status": "success" if "error" not in result else "error",
+                "result": result
+            })
+        except Exception as e:
+            results.append({
+                "file_name": file_info.get("file_name", "unknown"),
+                "status": "error",
+                "result": {"error": f"⚠ 處理失敗: {str(e)}"}
+            })
 
     return {
-        "message": "✅ 文件已成功處理並向量化",
-        "file_name": req.file_name,
-        "source_url": req.file_url,
-        "paragraphs": paragraphs_count
+        "message": f"批次處理完成",
+        "total_files": len(req.files),
+        "results": results
     }
 
 if __name__ == "__main__":

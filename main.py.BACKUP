@@ -1,4 +1,4 @@
-# ✅ main.py（TWCC）
+# ✅ main.py（TWCC）- 支援 URL 下載 + 優化文字解析
 from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, AutoModel
@@ -18,6 +18,7 @@ from tika import parser
 import tika
 import requests
 from dotenv import load_dotenv
+import re  # 新增：用於文字清理
 
 load_dotenv()
 
@@ -88,7 +89,7 @@ if os.path.exists(faiss_index_path):
     try:
         index = faiss.read_index(faiss_index_path)
     except Exception as e:
-        print("❌ 讀取 FAISS 索引失敗：", e)
+        print("⚠ 讀取 FAISS 索引失敗：", e)
         index = None
 else:
     index = None
@@ -99,50 +100,98 @@ if os.path.exists(faiss_ids_path):
 else:
     paragraph_ids = []
 
-#（已經不用）label_map = {0: "初級做法", 1: "進階做法", 2: "領先做法"}
-
+# === Pydantic 模型定義 ===
 class QueryRequest(BaseModel):
     message: str
 
-@app.post("/chat")
-def chat(req: QueryRequest):
-    prompt = f"""你是一位 ESG 永續報告分析師，請直接針對以下問題清楚簡短地回答，不要產生額外問題：\n問題：{req.message}\n回答："""
-    result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
-    answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
-    return {"reply": answer}
+class UploadDocumentRequest(BaseModel):
+    file_url: str
+    file_name: str
 
-@app.post("/rag_chat")
-def rag_chat(req: QueryRequest):
-    query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
-    D, I = index.search(query_vec, 3)
+class BatchUploadRequest(BaseModel):
+    files: list[dict]  # [{"file_url": "...", "file_name": "..."}]
 
-    # 印出取得的索引位置與對應的 Mongo _id
-    print("🔍 FAISS 找到的向量 ID 索引：", I)
-    top_ids = [paragraph_ids[idx] for idx in I[0]]
-    print("🧾 FAISS 找到的 MongoDB _id：", top_ids)
+# === 文字清理和驗證函數（參考你提供的程式碼）===
+def clean_text(text):
+    """清理文字：去除多餘空白和無效字符"""
+    if not text:
+        return ""
+    
+    # 合併多個空白字符為單一空格
+    text = re.sub(r'\s+', ' ', text)
+    
+    # 只保留：中文字、英文字母、數字、常見標點符號
+    text = re.sub(r'[^\w\s\u4e00-\u9fff，。！？：；（）、""''「」『』《》〈〉.,:;!?"\'()[\]{}\-—%$€£¥₩₹]', '', text)
+    
+    return text.strip()
 
-    # 向本機 API 請求原文
-    try:
-        response = requests.post(f"{local_api}/get_docs", json={"ids": top_ids}, timeout=10)
-        documents = response.json()
-        if isinstance(documents, dict) and "error" in documents:
-            return {"reply": f"❌ 本機 API 回傳錯誤：{documents['error']}", "references": []}
-        print("📚 取得 documents：", documents)
-    except Exception as e:
-        return {"reply": f"❌ 無法從本機 API 獲取段落：{str(e)}", "references": []}
+def is_valid_sentence(text):
+    """檢查句子是否為有效句子（排除奇怪符號和無意義內容）"""
+    if not text or len(text.strip()) < 10:  # 最少10個字符
+        return False
+    
+    # 允許：中文字、中文標點、英文字母、阿拉伯數字、常見符號
+    valid_pattern = re.compile(r'^[\u4e00-\u9fffA-Za-z0-9，。！？：；（）、「」『』《》〈〉.,:;!?"\'()\[\]{}\-—\s%$€£¥₩₹]{10,}$')
+    
+    if not valid_pattern.match(text):
+        return False
+    
+    # 排除只有數字和符號的內容
+    chinese_char_count = len(re.findall(r'[\u4e00-\u9fff]', text))
+    english_char_count = len(re.findall(r'[A-Za-z]', text))
+    
+    # 確保至少有一定比例的中文或英文字符
+    if (chinese_char_count + english_char_count) / len(text) < 0.3:
+        return False
+    
+    # 排除頁碼、目錄等無意義內容
+    meaningless_patterns = [
+        r'^\d+\s*$',  # 純數字
+        r'^第\s*\d+\s*頁\s*$',  # 頁碼
+        r'^頁\s*\d+\s*$',  # 頁碼
+        r'^目\s*錄\s*$',  # 目錄
+        r'^\.\.\.\s*$',  # 省略號
+        r'^[-—]+\s*$',  # 分隔線
+        r'^\s*[IVX]+\s*\.\s*$',  # 羅馬數字章節
+    ]
+    
+    for pattern in meaningless_patterns:
+        if re.match(pattern, text.strip()):
+            return False
+    
+    return True
 
-    if not documents:
-        return {"reply": "❌ 沒有找到任何相關段落。", "references": []}
+def extract_meaningful_sentences(text):
+    """從文字中提取有意義的句子"""
+    if not text:
+        return []
+    
+    meaningful_sentences = []
+    
+    # 先按段落分割
+    paragraphs = text.split('\n\n')
+    
+    for paragraph in paragraphs:
+        if not paragraph.strip():
+            continue
+        
+        # 按句號分割句子
+        sentences = re.split(r'(?<=[。！？])\s*', paragraph)
+        
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+            
+            # 清理文字
+            clean_sentence = clean_text(sentence)
+            
+            # 驗證是否為有效句子
+            if is_valid_sentence(clean_sentence):
+                meaningful_sentences.append(clean_sentence)
+    
+    return meaningful_sentences
 
-    # 建立 context
-    context_snippets = [doc['text'] for doc in documents]
-    prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
-    result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
-    answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
-
-    return {"reply": answer, "references": documents}
-
-
+# === 文件處理類別（優化版）===
 class DocumentProcessor:
     def __init__(self):
         self.extractors = {
@@ -151,74 +200,271 @@ class DocumentProcessor:
             '.doc': self._extract_doc,
             '.txt': self._extract_txt
         }
+    
     def _extract_pdf(self, file_path):
         try:
             doc = fitz.open(file_path)
-            text = "\n".join([page.get_text("text") for page in doc])
+            text = ""
+            for page_num, page in enumerate(doc):
+                page_text = page.get_text("text")
+                if page_text.strip():
+                    text += f"\n{page_text}\n"
             doc.close()
-            return text
+            
+            # 如果 PyMuPDF 沒有提取到內容，嘗試使用 Tika
+            if not text.strip():
+                print("📄 PyMuPDF 未提取到內容，嘗試 Tika...")
+                parsed = parser.from_file(file_path)
+                text = parsed.get("content", "") or ""
+            
+            return text.strip()
         except Exception as e:
             print(f"PDF處理錯誤 {file_path}: {e}")
-            return ""
+            # 備用方案：使用 Tika
+            try:
+                parsed = parser.from_file(file_path)
+                return (parsed.get("content", "") or "").strip()
+            except Exception as e2:
+                print(f"Tika 備用方案也失敗: {e2}")
+                return ""
+    
     def _extract_docx(self, file_path):
         try:
             doc = docx.Document(file_path)
-            return "\n".join([para.text for para in doc.paragraphs])
+            text = []
+            
+            # 提取段落
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    text.append(para.text)
+            
+            # 提取表格內容
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = []
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            row_text.append(cell.text.strip())
+                    if row_text:
+                        text.append(" | ".join(row_text))
+            
+            result = "\n".join(text)
+            
+            # 如果 python-docx 沒有提取到內容，嘗試使用 Tika
+            if not result.strip():
+                print("📄 python-docx 未提取到內容，嘗試 Tika...")
+                parsed = parser.from_file(file_path)
+                result = parsed.get("content", "") or ""
+            
+            return result.strip()
         except Exception as e:
             print(f"DOCX處理錯誤 {file_path}: {e}")
-            return ""
+            # 備用方案：使用 Tika
+            try:
+                parsed = parser.from_file(file_path)
+                return (parsed.get("content", "") or "").strip()
+            except Exception as e2:
+                print(f"Tika 備用方案也失敗: {e2}")
+                return ""
+    
     def _extract_doc(self, file_path):
         try:
             parsed = parser.from_file(file_path)
-            return parsed.get("content", "") or ""
+            content = parsed.get("content", "") or ""
+            return content.strip()
         except Exception as e:
             print(f"DOC處理錯誤 {file_path}: {e}")
             return ""
+    
     def _extract_txt(self, file_path):
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return f.read()
-        except Exception as e:
-            print(f"TXT處理錯誤 {file_path}: {e}")
-            return ""
+        # 嘗試多種編碼
+        encodings = ['utf-8', 'utf-8-sig', 'gbk', 'big5', 'cp1252', 'iso-8859-1']
+        
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    content = f.read().strip()
+                    if content:
+                        print(f"✅ 成功使用 {encoding} 編碼讀取 TXT 檔案")
+                        return content
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                print(f"TXT處理錯誤 (encoding: {encoding}): {e}")
+                continue
+        
+        print(f"⚠ 所有編碼都無法讀取 TXT 檔案: {file_path}")
+        return ""
+    
     def extract_text(self, file_path):
+        if not os.path.exists(file_path):
+            print(f"⚠ 檔案不存在: {file_path}")
+            return ""
+        
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            print(f"⚠ 檔案為空: {file_path}")
+            return ""
+        
+        print(f"🔍 開始處理檔案: {file_path} (大小: {file_size} bytes)")
+        
         ext = os.path.splitext(file_path)[1].lower()
-        extractor = self.extractors.get(ext)
-        return extractor(file_path) if extractor else ""
+        print(f"🔍 檔案副檔名: {ext}")
+        
+        if ext not in self.extractors:
+            print(f"⚠ 不支援的檔案格式: {ext}")
+            print(f"✅ 支援的格式: {list(self.extractors.keys())}")
+            return ""
+        
+        extractor = self.extractors[ext]
+        raw_text = extractor(file_path)
+        
+        if not raw_text or not raw_text.strip():
+            print(f"⚠ 未提取到任何文字內容")
+            return ""
+        
+        print(f"🔄 開始清理和驗證文字內容...")
+        
+        # 提取有意義的句子
+        meaningful_sentences = extract_meaningful_sentences(raw_text)
+        
+        if not meaningful_sentences:
+            print(f"⚠ 清理後沒有有效的句子")
+            return ""
+        
+        # 重新組合有效句子
+        clean_text_result = '\n'.join(meaningful_sentences)
+        
+        print(f"✅ 成功提取文字，原始長度: {len(raw_text)} 字元")
+        print(f"✅ 清理後長度: {len(clean_text_result)} 字元")
+        print(f"✅ 有效句子數量: {len(meaningful_sentences)}")
+        print(f"🔍 預覽前3句: {meaningful_sentences[:3]}")
+        
+        return clean_text_result
 
-@app.post("/upload-document")
-async def upload_document(file: UploadFile = File(...)):
-    upload_dir = "./upload"
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, file.filename)
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+# === 下載函數 ===
+def download_file(url: str, local_path: str, timeout: int = 30) -> bool:
+    """
+    從 URL 下載檔案到本機路徑
+    """
+    try:
+        print(f"🌐 開始下載檔案: {url}")
+        
+        # 設定請求標頭
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        response.raise_for_status()
+        
+        # 檢查內容長度
+        content_length = response.headers.get('Content-Length')
+        if content_length:
+            file_size = int(content_length)
+            print(f"📊 檔案大小: {file_size} bytes")
+            
+            # 檢查檔案大小限制（例如 100MB）
+            max_size = 100 * 1024 * 1024  # 100MB
+            if file_size > max_size:
+                print(f"⚠ 檔案過大: {file_size} bytes > {max_size} bytes")
+                return False
+        
+        # 下載檔案
+        with open(local_path, 'wb') as f:
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+        
+        print(f"✅ 檔案下載完成: {local_path} ({downloaded} bytes)")
+        return True
+        
+    except requests.exceptions.RequestException as e:
+        print(f"⚠ 網路請求錯誤: {e}")
+        return False
+    except Exception as e:
+        print(f"⚠ 下載檔案時發生錯誤: {e}")
+        return False
 
-    processor = DocumentProcessor()
-    text = processor.extract_text(file_path)
-    os.remove(file_path)
-    if not text.strip():
-        return {"error": "❌ 檔案無法擷取文字內容"}
+# === 文字分塊函數（優化版）===
+def chunk_text(text, max_length=400, overlap=50):
+    """
+    智能文字分塊，優先按句號分割，避免句子被截斷
+    """
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    sentences = re.split(r'(?<=[。！？])\s*', text)
+    
+    current_chunk = ""
+    
+    for sentence in sentences:
+        # 如果當前句子本身就超過最大長度，強制分割
+        if len(sentence) > max_length:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            
+            # 對長句子進行強制分割
+            start = 0
+            while start < len(sentence):
+                end = start + max_length
+                chunks.append(sentence[start:end])
+                start = end - overlap
+        else:
+            # 檢查加入這個句子是否會超過長度限制
+            if len(current_chunk) + len(sentence) > max_length:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence
+            else:
+                current_chunk += sentence
+    
+    # 添加最後一個塊
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    # 過濾掉太短的塊
+    chunks = [chunk for chunk in chunks if len(chunk.strip()) >= 20]
+    
+    return chunks
 
-    def chunk_text(text, max_length=500, overlap=50):
-        if len(text) <= max_length:
-            return [text]
-        chunks, start = [], 0
-        while start < len(text):
-            end = start + max_length
-            chunks.append(text[start:end])
-            start = end - overlap
-        return chunks
-
+# === 向量化處理函數 ===
+def process_document_to_vectors(text, source_name, source_url=None):
+    """
+    將文字轉換為向量並存入 FAISS 和 MongoDB
+    """
+    global index, paragraph_ids
+    
+    # 使用優化的分塊函數
     paragraphs = chunk_text(text)
-    paragraph_labels = [{"source": file.filename, "category": "uploaded_document", "chunk_id": i} for i in range(len(paragraphs))]
+    print(f"📝 文字分塊完成，共 {len(paragraphs)} 個段落")
+    
+    paragraph_labels = [
+        {
+            "source": source_name,
+            "category": "remote_document" if source_url else "uploaded_document",
+            "chunk_id": i,
+            "source_url": source_url
+        } 
+        for i in range(len(paragraphs))
+    ]
+    
     embeddings, new_ids = [], []
 
+    # 生成向量並準備文檔
     for para, label in zip(paragraphs, paragraph_labels):
+        if len(para.strip()) < 10:  # 跳過太短的段落
+            continue
+            
         emb = embedding_model.get_embedding(para, device).cpu().numpy()
         embeddings.append(emb)
         para_id = str(uuid.uuid4())
         new_ids.append(para_id)
+        
         doc = {
             "_id": para_id,
             "text": para,
@@ -232,31 +478,195 @@ async def upload_document(file: UploadFile = File(...)):
                 "chunk_index": label["chunk_id"]
             }
         }
+        
+        # 如果有 URL，添加到 meta 中
+        if source_url:
+            doc["meta"]["source_url"] = source_url
+        
+        # 插入 MongoDB
         try:
-            res = requests.post(f"https://{local_api}/insert_doc", json=doc, timeout=10)
+            # 修正：移除多餘的 https://
+            api_url = local_api if local_api.startswith('http') else f"https://{local_api}"
+            res = requests.post(f"{api_url}/insert_doc", json=doc, timeout=10)
             res.raise_for_status()
+            print(f"✅ 成功插入文檔片段到 MongoDB: {para_id}")
         except Exception as e:
-            print("❌ 本機插入 MongoDB 失敗：", e)
+            print(f"⚠ 插入 MongoDB 失敗: {e}")
 
-    new_embeddings = np.vstack(embeddings)
+    # 更新 FAISS 索引
+    if embeddings:
+        new_embeddings = np.vstack(embeddings)
+        
+        if index is None:
+            index = faiss.IndexFlatL2(new_embeddings.shape[1])
+            print("🔍 創建新的 FAISS 索引")
+        
+        index.add(new_embeddings)
+        paragraph_ids.extend(new_ids)
+
+        # 保存 FAISS 索引
+        faiss.write_index(index, faiss_index_path)
+        with open(faiss_ids_path, "w") as f:
+            json.dump(paragraph_ids, f)
+        
+        print(f"✅ FAISS 索引已更新，新增 {len(new_ids)} 個向量")
+    
+    return len(paragraphs), new_embeddings.shape[1] if embeddings else 0, paragraphs[:3], len(new_ids)
+
+# === 聊天端點 ===
+@app.post("/chat")
+def chat(req: QueryRequest):
+    prompt = f"""你是一位 ESG 永續報告分析師，請直接針對以下問題清楚簡短地回答，不要產生額外問題：\n問題：{req.message}\n回答："""
+    result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
+    answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
+    return {"reply": answer}
+
+@app.post("/rag_chat")
+def rag_chat(req: QueryRequest):
     if index is None:
-        index = faiss.IndexFlatL2(new_embeddings.shape[1])
-    index.add(new_embeddings)
-    paragraph_ids.extend(new_ids)
+        return {"reply": "⚠ FAISS 索引尚未初始化，請先上傳文件。", "references": []}
+    
+    query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
+    D, I = index.search(query_vec, 3)
 
-    faiss.write_index(index, faiss_index_path)
-    with open(faiss_ids_path, "w") as f:
-        json.dump(paragraph_ids, f)
+    # 列出取得的索引位置與對應的 Mongo _id
+    print("🔍 FAISS 找到的向量 ID 索引：", I)
+    top_ids = [paragraph_ids[idx] for idx in I[0] if idx < len(paragraph_ids)]
+    print("🧾 FAISS 找到的 MongoDB _id：", top_ids)
+
+    if not top_ids:
+        return {"reply": "⚠ 沒有找到相關的文件段落。", "references": []}
+
+    # 向本機 API 請求原文
+    try:
+        response = requests.post(f"{local_api}/get_docs", json={"ids": top_ids}, timeout=10)
+        documents = response.json()
+        if isinstance(documents, dict) and "error" in documents:
+            return {"reply": f"⚠ 本機 API 回傳錯誤：{documents['error']}", "references": []}
+        print("📚 取得 documents：", documents)
+    except Exception as e:
+        return {"reply": f"⚠ 無法從本機 API 獲取段落：{str(e)}", "references": []}
+
+    if not documents:
+        return {"reply": "⚠ 沒有找到任何相關段落。", "references": []}
+
+    # 建立 context
+    context_snippets = [doc['text'] for doc in documents]
+    prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
+    result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
+    answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
+
+    return {"reply": answer, "references": documents}
+
+# === 上傳端點（原有的檔案上傳功能）===
+@app.post("/upload-document")
+async def upload_document(file: UploadFile = File(...)):
+    print(f"📤 收到上傳檔案: {file.filename}")
+    
+    upload_dir = "./upload"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, file.filename)
+    
+    try:
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        processor = DocumentProcessor()
+        text = processor.extract_text(file_path)
+        
+        # 清理臨時檔案
+        os.remove(file_path)
+        
+        if not text.strip():
+            return {"error": "⚠ 檔案無法擷取文字內容"}
+
+        # 處理向量化
+        paragraphs_count, dimension, preview, new_faiss_added = process_document_to_vectors(
+            text, file.filename
+        )
+
+        return {
+            "message": "✅ 文件已向量化",
+            "paragraphs": paragraphs_count,
+            "dimension": dimension,
+            "preview": preview,
+            "new_faiss_added": new_faiss_added,
+            "text_length": len(text)
+        }
+    
+    except Exception as e:
+        # 確保清理臨時檔案
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return {"error": f"⚠ 檔案處理失敗: {str(e)}"}
+
+# === 新的 URL 下載端點 ===
+@app.post("/upload_documents")
+async def upload_documents(req: UploadDocumentRequest):
+    """
+    從 URL 下載文件並進行向量化處理
+    """
+    print(f"📤 收到文件處理請求: {req.file_name} from {req.file_url}")
+    
+    # 驗證檔案名稱
+    if not req.file_name:
+        return {"error": "⚠ 檔案名稱為空"}
+    
+    # 驗證 URL
+    if not req.file_url or not req.file_url.startswith(('http://', 'https://')):
+        return {"error": "⚠ 無效的檔案 URL"}
+    
+    # 檢查檔案副檔名
+    ext = os.path.splitext(req.file_name)[1].lower()
+    supported_formats = ['.pdf', '.docx', '.doc', '.txt']
+    if ext not in supported_formats:
+        return {
+            "error": f"⚠ 不支援的檔案格式 '{ext}'",
+            "supported_formats": supported_formats
+        }
+    
+    # 建立臨時目錄
+    temp_dir = "./temp_downloads"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # 生成唯一的本機檔案路徑
+    unique_id = str(uuid.uuid4())[:8]
+    safe_filename = f"{unique_id}_{req.file_name}"
+    local_file_path = os.path.join(temp_dir, safe_filename)
+    
+    # 下載檔案
+    if not download_file(req.file_url, local_file_path):
+        return {"error": "⚠ 檔案下載失敗"}
+        
+    # 處理文件
+    processor = DocumentProcessor()
+    text = processor.extract_text(local_file_path)
+        
+    if not text or not text.strip():
+        return {
+            "error": "⚠ 檔案無法擷取文字內容",
+            "file_name": req.file_name,
+            "possible_reasons": [
+                "檔案可能是掃描的圖片 PDF（需要 OCR）",
+                "檔案內容為空或損壞",
+                "檔案格式不正確",
+                "檔案使用不支援的編碼",
+                "檔案包含太多無意義的內容（已被過濾）"
+            ]
+        }
+        
+    # 處理向量化
+    paragraphs_count, dimension, preview, new_faiss_added = process_document_to_vectors(
+        text, req.file_name, req.file_url
+    )
 
     return {
-        "message": "✅ 文件已向量化",
-        "paragraphs": len(paragraphs),
-        "dimension": new_embeddings.shape[1],
-        "preview": paragraphs[:3],
-        "new_faiss_added": len(new_ids)
+        "message": "✅ 文件已成功處理並向量化",
+        "file_name": req.file_name,
+        "source_url": req.file_url,
+        "paragraphs": paragraphs_count
     }
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=5000)
-
