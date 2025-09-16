@@ -558,7 +558,7 @@ def rag_chat(req: QueryRequest):
     # 建立 context
     context_snippets = [doc['text'] for doc in documents]
     prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
-    result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
+    result = pipe(prompt, max_new_tokens=3000)[0]['generated_text']
     answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
 
     return {"reply": answer, "references": documents}
