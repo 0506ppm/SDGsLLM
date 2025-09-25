@@ -572,7 +572,7 @@ def process_document_to_vectors(text, source_name, source_url=None):
 # === 聊天端點 ===
 @app.post("/chat")
 def chat(req: QueryRequest):
-    prompt = f"""你是一位 ESG 永續報告分析師，請直接針對以下問題清楚簡短地回答，不要產生額外問題：\n問題：{req.message}\n回答："""
+    prompt = f"""你是一位 ESG 永續報告分析師，請直接針對以下問題清楚簡短地回答，不要產生額外問題，此外，請用單純的文字回答，不要有格式：\n問題：{req.message}\n回答："""
     result = pipe(prompt, max_new_tokens=200)[0]['generated_text']
     answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
     return {"reply": answer}
@@ -608,7 +608,7 @@ def rag_chat(req: QueryRequest):
 
     # 建立 context
     context_snippets = [doc['text'] for doc in documents]
-    prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
+    prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。此外，請用單純的文字回答，不要有格式。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
     result = pipe(prompt, max_new_tokens=3000)[0]['generated_text']
     answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
 
@@ -629,7 +629,7 @@ def gpt_chat(req: QueryRequest):
             messages=[
                 {
                     "role": "system",
-                    "content": "你是一位專業的 ESG 永續報告分析師。請根據你的專業知識回答用戶的問題。如果問題超出你的知識範圍，請誠實說明。"
+                    "content": "你是一位專業的 ESG 永續報告分析師。請根據你的專業知識回答用戶的問題。如果問題超出你的知識範圍，請誠實說明。此外，請用單純的文字回答，不要有格式。"
                 },
                 {
                     "role": "user",
@@ -685,7 +685,7 @@ def gpt_chat(req: QueryRequest):
                     messages=[
                         {
                             "role": "system",
-                            "content": "你是一位專業的 ESG 永續報告分析師。請根據你的專業知識回答用戶的問題。如果問題超出你的知識範圍，請誠實說明。"
+                            "content": "你是一位專業的 ESG 永續報告分析師。請根據你的專業知識回答用戶的問題。如果問題超出你的知識範圍，請誠實說明。此外，請用單純的文字回答，不要有格式。"
                         },
                         {
                             "role": "user",
