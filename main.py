@@ -437,86 +437,137 @@ def chunk_text(text, max_length=400, overlap=50):
     
     return chunks
 
-# === 向量化處理函數 ===
+# === 向量化處理函數（修正版）===
 def process_document_to_vectors(text, source_name, source_url=None):
     """
     將文字轉換為向量並存入 FAISS 和 MongoDB
     """
     global index, paragraph_ids
     
-    # 使用優化的分塊函數
-    paragraphs = chunk_text(text)
-    print(f"📝 文字分塊完成，共 {len(paragraphs)} 個段落")
-    
-    paragraph_labels = [
-        {
-            "source": source_name,
-            "category": "remote_document" if source_url else "uploaded_document",
-            "chunk_id": i,
-            "source_url": source_url
-        } 
-        for i in range(len(paragraphs))
-    ]
-    
-    embeddings, new_ids = [], []
+    try:
+        # 檢查必要的組件
+        if not embedding_model:
+            print("❌ Embedding 模型未載入")
+            return 0, 0, [], 0
+        
+        if not text or not text.strip():
+            print("❌ 輸入文字為空")
+            return 0, 0, [], 0
+        
+        # 使用優化的分塊函數
+        paragraphs = chunk_text(text)
+        print(f"📝 文字分塊完成，共 {len(paragraphs)} 個段落")
+        
+        if not paragraphs:
+            print("❌ 文字分塊後沒有內容")
+            return 0, 0, [], 0
+        
+        paragraph_labels = [
+            {
+                "source": source_name,
+                "category": "remote_document" if source_url else "uploaded_document",
+                "chunk_id": i,
+                "source_url": source_url
+            } 
+            for i in range(len(paragraphs))
+        ]
+        
+        embeddings, new_ids = [], []
+        processed_count = 0
 
-    # 生成向量並準備文檔
-    for para, label in zip(paragraphs, paragraph_labels):
-        if len(para.strip()) < 10:  # 跳過太短的段落
-            continue
-            
-        emb = embedding_model.get_embedding(para, device).cpu().numpy()
-        embeddings.append(emb)
-        para_id = str(uuid.uuid4())
-        new_ids.append(para_id)
-        
-        doc = {
-            "_id": para_id,
-            "text": para,
-            "category": label["category"],
-            "source": label["source"],
-            "chunk_id": label["chunk_id"],
-            "meta": {
-                "source_file": label["source"],
-                "category": label["category"],
-                "length": len(para),
-                "chunk_index": label["chunk_id"]
-            }
-        }
-        
-        # 如果有 URL，添加到 meta 中
-        if source_url:
-            doc["meta"]["source_url"] = source_url
-        
-        # 插入 MongoDB
+        # 生成向量並準備文檔
+        for para, label in zip(paragraphs, paragraph_labels):
+            if len(para.strip()) < 10:  # 跳過太短的段落
+                continue
+                
+            try:
+                # 嘗試生成向量
+                emb = embedding_model.get_embedding(para, device).cpu().numpy()
+                embeddings.append(emb)
+                para_id = str(uuid.uuid4())
+                new_ids.append(para_id)
+                processed_count += 1
+                
+                doc = {
+                    "_id": para_id,
+                    "text": para,
+                    "category": label["category"],
+                    "source": label["source"],
+                    "chunk_id": label["chunk_id"],
+                    "meta": {
+                        "source_file": label["source"],
+                        "category": label["category"],
+                        "length": len(para),
+                        "chunk_index": label["chunk_id"]
+                    }
+                }
+                
+                # 如果有 URL，添加到 meta 中
+                if source_url:
+                    doc["meta"]["source_url"] = source_url
+                
+                # 插入 MongoDB
+                if local_api:
+                    try:
+                        # 修正：移除多餘的 https://
+                        api_url = local_api if local_api.startswith('http') else f"https://{local_api}"
+                        res = requests.post(f"{api_url}/insert_doc", json=doc, timeout=10)
+                        res.raise_for_status()
+                        print(f"✅ 成功插入文檔片段到 MongoDB: {para_id}")
+                    except requests.exceptions.Timeout:
+                        print(f"⚠️ MongoDB 插入超時: {para_id}")
+                    except requests.exceptions.RequestException as e:
+                        print(f"⚠️ MongoDB 請求失敗: {e}")
+                    except Exception as e:
+                        print(f"⚠️ 插入 MongoDB 失敗: {e}")
+                else:
+                    print("⚠️ LOCAL_API 未設定，跳過 MongoDB 插入")
+                    
+            except torch.cuda.OutOfMemoryError:
+                print(f"❌ GPU 記憶體不足，無法處理段落 {processed_count}")
+                # 清理 GPU 記憶體
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                print(f"❌ 處理段落 {processed_count} 時發生錯誤: {e}")
+                continue
+
+        # 檢查是否有成功處理的向量
+        if not embeddings:
+            print("❌ 沒有成功生成任何向量")
+            return 0, 0, [], 0
+
+        # 更新 FAISS 索引
         try:
-            # 修正：移除多餘的 https://
-            api_url = local_api if local_api.startswith('http') else f"https://{local_api}"
-            res = requests.post(f"{api_url}/insert_doc", json=doc, timeout=10)
-            res.raise_for_status()
-            print(f"✅ 成功插入文檔片段到 MongoDB: {para_id}")
+            new_embeddings = np.vstack(embeddings)
+            
+            if index is None:
+                index = faiss.IndexFlatL2(new_embeddings.shape[1])
+                print("🔍 創建新的 FAISS 索引")
+            
+            index.add(new_embeddings)
+            paragraph_ids.extend(new_ids)
+
+            # 保存 FAISS 索引
+            try:
+                faiss.write_index(index, faiss_index_path)
+                with open(faiss_ids_path, "w") as f:
+                    json.dump(paragraph_ids, f)
+                
+                print(f"✅ FAISS 索引已更新，新增 {len(new_ids)} 個向量")
+            except Exception as e:
+                print(f"❌ 保存 FAISS 索引失敗: {e}")
+        
         except Exception as e:
-            print(f"⚠ 插入 MongoDB 失敗: {e}")
-
-    # 更新 FAISS 索引
-    if embeddings:
-        new_embeddings = np.vstack(embeddings)
+            print(f"❌ 更新 FAISS 索引失敗: {e}")
+            return len(paragraphs), 0, paragraphs[:3], 0
         
-        if index is None:
-            index = faiss.IndexFlatL2(new_embeddings.shape[1])
-            print("🔍 創建新的 FAISS 索引")
+        return len(paragraphs), new_embeddings.shape[1] if embeddings else 0, paragraphs[:3], len(new_ids)
         
-        index.add(new_embeddings)
-        paragraph_ids.extend(new_ids)
-
-        # 保存 FAISS 索引
-        faiss.write_index(index, faiss_index_path)
-        with open(faiss_ids_path, "w") as f:
-            json.dump(paragraph_ids, f)
-        
-        print(f"✅ FAISS 索引已更新，新增 {len(new_ids)} 個向量")
-    
-    return len(paragraphs), new_embeddings.shape[1] if embeddings else 0, paragraphs[:3], len(new_ids)
+    except Exception as e:
+        print(f"❌ 向量化處理失敗: {e}")
+        print(f"📋 詳細錯誤: {traceback.format_exc()}")
+        return 0, 0, [], 0
 
 # === 聊天端點 ===
 @app.post("/chat")
@@ -729,52 +780,75 @@ async def upload_document(file: UploadFile = File(...)):
             os.remove(file_path)
         return {"error": f"⚠ 檔案處理失敗: {str(e)}"}
 
-# === 新的 URL 下載端點 ===
+
 @app.post("/upload_documents")
 async def upload_documents(req: UploadDocumentRequest):
     """
     從 URL 下載文件並進行向量化處理
     """
-    print(f"📤 收到文件處理請求: {req.file_name} from {req.file_url}")
-
-    # 驗證檔案名稱
-    if not req.file_name:
-        return {"error": "⚠ 檔案名稱為空"}
-
-    # 驗證 URL
-    if not req.file_url or not req.file_url.startswith(('http://', 'https://')):
-        return {"error": "⚠ 無效的檔案 URL"}
-
-    # 檢查檔案副檔名
-    ext = os.path.splitext(req.file_name)[1].lower()
-    supported_formats = ['.pdf', '.docx', '.doc', '.txt']
-    if ext not in supported_formats:
-        return {
-            "error": f"⚠ 不支援的檔案格式 '{ext}'",
-            "supported_formats": supported_formats
-        }
-
-    # 建立臨時目錄
-    temp_dir = "./temp_downloads"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    # 生成唯一的本機檔案路徑
-    unique_id = str(uuid.uuid4())[:8]
-    safe_filename = f"{unique_id}_{req.file_name}"
-    local_file_path = os.path.join(temp_dir, safe_filename)
-
+    local_file_path = None
+    
     try:
+        print(f"📤 收到文件處理請求: {req.file_name} from {req.file_url}")
+
+        # 驗證輸入參數
+        if not req.file_name:
+            return {"success": False, "error": "檔案名稱為空"}
+
+        if not req.file_url or not req.file_url.startswith(('http://', 'https://')):
+            return {"success": False, "error": "無效的檔案 URL"}
+
+        # 檢查檔案副檔名
+        ext = os.path.splitext(req.file_name)[1].lower()
+        supported_formats = ['.pdf', '.docx', '.doc', '.txt']
+        if ext not in supported_formats:
+            return {
+                "success": False,
+                "error": f"不支援的檔案格式 '{ext}'",
+                "supported_formats": supported_formats
+            }
+
+        # 建立臨時目錄
+        temp_dir = "./temp_downloads"
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+        except Exception as e:
+            return {"success": False, "error": f"無法建立臨時目錄: {str(e)}"}
+
+        # 生成唯一的本機檔案路徑
+        unique_id = str(uuid.uuid4())[:8]
+        safe_filename = f"{unique_id}_{req.file_name}"
+        local_file_path = os.path.join(temp_dir, safe_filename)
+
         # 下載檔案
-        if not download_file(req.file_url, local_file_path):
-            return {"error": "⚠ 檔案下載失敗"}
+        try:
+            if not download_file(req.file_url, local_file_path):
+                return {"success": False, "error": "檔案下載失敗"}
+        except Exception as e:
+            return {"success": False, "error": f"下載檔案時發生錯誤: {str(e)}"}
+
+        # 檢查下載的檔案
+        if not os.path.exists(local_file_path):
+            return {"success": False, "error": "下載的檔案不存在"}
+        
+        if os.path.getsize(local_file_path) == 0:
+            return {"success": False, "error": "下載的檔案為空"}
 
         # 處理文件
-        processor = DocumentProcessor()
-        text = processor.extract_text(local_file_path)
+        try:
+            processor = DocumentProcessor()
+            text = processor.extract_text(local_file_path)
+        except Exception as e:
+            return {
+                "success": False, 
+                "error": f"文件內容提取失敗: {str(e)}",
+                "file_name": req.file_name
+            }
 
         if not text or not text.strip():
             return {
-                "error": "⚠ 檔案無法擷取文字內容",
+                "success": False,
+                "error": "檔案無法擷取文字內容",
                 "file_name": req.file_name,
                 "possible_reasons": [
                     "檔案可能是掃描的圖片 PDF（需要 OCR）",
@@ -786,11 +860,27 @@ async def upload_documents(req: UploadDocumentRequest):
             }
 
         # 處理向量化
-        paragraphs_count, dimension, preview, new_faiss_added = process_document_to_vectors(
-            text, req.file_name, req.file_url
-        )
+        try:
+            paragraphs_count, dimension, preview, new_faiss_added = process_document_to_vectors(
+                text, req.file_name, req.file_url
+            )
+            
+            if paragraphs_count == 0:
+                return {
+                    "success": False,
+                    "error": "向量化處理失敗，沒有生成任何向量",
+                    "file_name": req.file_name
+                }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"向量化處理失敗: {str(e)}",
+                "file_name": req.file_name
+            }
 
         return {
+            "success": True,
             "message": "✅ 文件已成功處理並向量化",
             "file_name": req.file_name,
             "source_url": req.file_url,
@@ -803,50 +893,123 @@ async def upload_documents(req: UploadDocumentRequest):
         }
 
     except Exception as e:
-        print(f"⚠ 處理檔案時發生錯誤: {e}")
+        print(f"❌ upload_documents 處理失敗: {e}")
+        print(f"📋 詳細錯誤: {traceback.format_exc()}")
         return {
-            "error": f"⚠ 檔案處理失敗: {str(e)}",
-            "file_name": req.file_name
+            "success": False,
+            "error": f"檔案處理失敗: {str(e)}",
+            "file_name": getattr(req, 'file_name', 'unknown')
         }
 
     finally:
-        # 清理臨時檔案
-        try:
-            if os.path.exists(local_file_path):
+        # 確保清理臨時檔案
+        if local_file_path and os.path.exists(local_file_path):
+            try:
                 os.remove(local_file_path)
                 print(f"🗑️ 已清理臨時檔案: {local_file_path}")
-        except Exception as e:
-            print(f"⚠️ 清理臨時檔案失敗: {e}")
+            except Exception as e:
+                print(f"⚠️ 清理臨時檔案失敗: {e}")
 
-# === 批次處理端點 ===
+# === 批次處理端點（修正版）===
 @app.post("/upload_documents_batch")
 async def upload_documents_batch(req: BatchUploadRequest):
     """
     批次處理多個文件
     """
-    results = []
+    try:
+        # 驗證輸入
+        if not req.files:
+            return {"success": False, "error": "沒有提供任何檔案"}
+        
+        if len(req.files) > 50:  # 限制批次處理數量
+            return {"success": False, "error": "批次處理檔案數量超過限制（最多 50 個）"}
+        
+        results = []
+        success_count = 0
+        error_count = 0
 
-    for file_info in req.files:
-        try:
-            file_req = UploadDocumentRequest(**file_info)
-            result = await upload_documents(file_req)
-            results.append({
-                "file_name": file_info.get("file_name"),
-                "status": "success" if "error" not in result else "error",
-                "result": result
-            })
-        except Exception as e:
-            results.append({
-                "file_name": file_info.get("file_name", "unknown"),
-                "status": "error",
-                "result": {"error": f"⚠ 處理失敗: {str(e)}"}
-            })
+        print(f"🚀 開始批次處理 {len(req.files)} 個檔案")
 
-    return {
-        "message": f"批次處理完成",
-        "total_files": len(req.files),
-        "results": results
-    }
+        for index, file_info in enumerate(req.files):
+            try:
+                print(f"📄 處理檔案 {index + 1}/{len(req.files)}: {file_info.get('file_name', 'unknown')}")
+                
+                # 驗證單個檔案資訊
+                if not isinstance(file_info, dict):
+                    error_count += 1
+                    results.append({
+                        "file_index": index,
+                        "file_name": "unknown",
+                        "status": "error",
+                        "result": {"success": False, "error": "檔案資訊格式錯誤"}
+                    })
+                    continue
+                
+                if 'file_name' not in file_info or 'file_url' not in file_info:
+                    error_count += 1
+                    results.append({
+                        "file_index": index,
+                        "file_name": file_info.get('file_name', 'unknown'),
+                        "status": "error",
+                        "result": {"success": False, "error": "缺少必要的檔案資訊（file_name 或 file_url）"}
+                    })
+                    continue
+                
+                # 建立單個檔案處理請求
+                file_req = UploadDocumentRequest(**file_info)
+                result = await upload_documents(file_req)
+                
+                # 根據結果更新計數器
+                if result.get("success", False):
+                    success_count += 1
+                    status = "success"
+                else:
+                    error_count += 1
+                    status = "error"
+                
+                results.append({
+                    "file_index": index,
+                    "file_name": file_info.get("file_name"),
+                    "status": status,
+                    "result": result
+                })
+                
+            except Exception as e:
+                error_count += 1
+                print(f"❌ 批次處理單一檔案失敗: {e}")
+                results.append({
+                    "file_index": index,
+                    "file_name": file_info.get("file_name", "unknown"),
+                    "status": "error",
+                    "result": {"success": False, "error": f"處理失敗: {str(e)}"}
+                })
+
+        # 計算處理統計
+        total_files = len(req.files)
+        success_rate = (success_count / total_files) * 100 if total_files > 0 else 0
+
+        print(f"📊 批次處理完成: {success_count} 成功, {error_count} 失敗")
+
+        return {
+            "success": True,
+            "message": f"批次處理完成",
+            "total_files": total_files,
+            "success_count": success_count,
+            "error_count": error_count,
+            "success_rate": round(success_rate, 2),
+            "results": results
+        }
+        
+    except Exception as e:
+        print(f"❌ 批次上傳處理失敗: {e}")
+        print(f"📋 詳細錯誤: {traceback.format_exc()}")
+        return {
+            "success": False, 
+            "error": f"批次處理失敗: {str(e)}",
+            "total_files": len(req.files) if hasattr(req, 'files') and req.files else 0,
+            "results": []
+        }
+
 
 if __name__ == "__main__":
     import uvicorn
