@@ -617,6 +617,47 @@ def rag_chat(req: QueryRequest):
 @app.post("/gpt_chat")
 def gpt_chat(req: QueryRequest):
     """
+    直接請 Groq API 回答問題（不使用 RAG / 檢索）
+    """
+    # 檢查 Groq API Key
+    if not groq_api_key:
+        return {"error": "⚠ GROQ_API_KEY 未設定"}
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是一位專業的 ESG 永續報告分析師。請根據你的專業知識回答用戶的問題。如果問題超出你的知識範圍，請誠實說明。"
+                },
+                {
+                    "role": "user",
+                    "content": req.message
+                }
+            ],
+            temperature=0.7,
+            max_completion_tokens=1000,
+            top_p=1,
+            reasoning_effort="medium",
+            stream=False,
+            stop=None
+        )
+        
+        answer = completion.choices[0].message.content
+        return {
+            "reply": answer,
+            "references": [],
+            "note": "基於模型自身知識回答（未檢索任何文件）"
+        }
+
+    except Exception as e:
+        return {"error": f"⚠ Groq API 調用失敗：{str(e)}"}
+
+
+@app.post("/gpt_rag_chat")
+def gpt_chat(req: QueryRequest):
+    """
     使用 RAG 檢索相關文件，然後透過 Groq API 回答問題
     """
     # 檢查 Groq API Key
