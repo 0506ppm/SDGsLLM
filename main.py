@@ -661,76 +661,94 @@ def chat(req: QueryRequest):
 @app.post("/rag_chat")
 def rag_chat(req: QueryRequest):
     if index is None:
-        return {"reply": "⚠ FAISS 索引尚未初始化，請先上傳文件。", "references": []}
+        return {"reply": "⚠ FAISS 索引尚未初始化,請先上傳文件。", "references": []}
 
-    # === 第一階段：FAISS 向量檢索 ===
+    # === 取得使用者角色 ===
+    role = getattr(req, "role", None) or "外部人士"  # 預設為外部人士
+    print(f"👤 使用者角色: {role}")
+
+    # === 第一階段: FAISS 向量檢索 ===
     query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
 
     initial_k = 25  # 先抓 25 個候選文檔
     D, I = index.search(query_vec, initial_k)
 
-    # 列出取得的索引位置與對應的 Mongo _id
-    print(f"🔍 FAISS 檢索：取得 {initial_k} 個候選文檔")
-    print("🔍 FAISS 找到的向量 ID 索引：", I)
+    print(f"🔍 FAISS 檢索:取得 {initial_k} 個候選文檔")
+    print("🔍 FAISS 找到的向量 ID 索引:", I)
     top_ids = [paragraph_ids[idx] for idx in I[0] if idx < len(paragraph_ids)]
-    print("🧾 FAISS 找到的 MongoDB _id：", top_ids)
+    print("🧾 FAISS 找到的 MongoDB _id:", top_ids)
 
     if not top_ids:
         return {"reply": "⚠ 沒有找到相關的文件段落。", "references": []}
 
-    # 向本機 API 請求原文
+    # === 取得原始段落 ===
     try:
         api_url = local_api if local_api.startswith('http') else f"https://{local_api}"
         response = requests.post(f"{api_url}/get_docs", json={"ids": top_ids}, timeout=10)
         documents = response.json()
         if isinstance(documents, dict) and "error" in documents:
-            return {"reply": f"⚠ 本機 API 回傳錯誤：{documents['error']}", "references": []}
+            return {"reply": f"⚠ 本機 API 回傳錯誤: {documents['error']}", "references": []}
         print(f"📚 取得 {len(documents)} 個候選文檔")
     except Exception as e:
-        return {"reply": f"⚠ 無法從本機 API 獲取段落：{str(e)}", "references": []}
+        return {"reply": f"⚠ 無法從本機 API 獲取段落: {str(e)}", "references": []}
 
     if not documents:
         return {"reply": "⚠ 沒有找到任何相關段落。", "references": []}
 
-    # === 第二階段：Rerank 精選 ===
-    print(f"🎯 開始 Rerank，候選文檔數：{len(documents)}")
-    final_k = 5  # 最終保留 5 個
+    # === 第二階段: Rerank 精選 ===
+    print(f"🎯 開始 Rerank, 候選文檔數: {len(documents)}")
+    final_k = 5
     reranked_documents = rerank_documents(req.message, documents, top_k=final_k)
 
     if not reranked_documents:
-        print("⚠️ Rerank 後沒有文檔，使用原始文檔")
+        print("⚠️ Rerank 後沒有文檔,使用原始文檔")
         reranked_documents = documents[:final_k]
 
     print(f"✅ 將使用 {len(reranked_documents)} 個文檔生成回答")
-    
+
     print("\n" + "="*80)
-    print("📄 Rerank 後採用的文檔：")
+    print("📄 Rerank 後採用的文檔:")
     print("="*80)
     for i, doc in enumerate(reranked_documents, 1):
         rerank_score = doc.get('rerank_score', 'N/A')
         source = doc.get('source', 'unknown')
-        text_preview = doc.get('text', '')[:150]  # 只顯示前 150 個字
-
+        text_preview = doc.get('text', '')[:150]
         print(f"\n【文檔 {i}】")
-        print(f"  Rerank 分數：{rerank_score}")
-        print(f"  來源：{source}")
-        print(f"  內容預覽：{text_preview}...")
-        print(f"  完整長度：{len(doc.get('text', ''))} 字元")
+        print(f"  Rerank 分數: {rerank_score}")
+        print(f"  來源: {source}")
+        print(f"  內容預覽: {text_preview}...")
+        print(f"  完整長度: {len(doc.get('text', ''))} 字元")
     print("="*80 + "\n")
 
-    # === 第三階段：建立 context 並生成回答 ===
+    # === 第三階段: 建立 prompt ===
     context_snippets = [doc['text'] for doc in reranked_documents]
-    prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。此外，請用單純的文字回答，不要有格式。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
+
+    if role == "內部人士":
+        role_instruction = "你可以提供精確的數字與細節，回答需盡量具體。"
+    else:
+        role_instruction = "請避免提供任何精確數字，改用『約』『大約』『少於』『超過』等模糊表達。"
+
+    prompt = (
+        f"你是一位 ESG 永續報告分析師。{role_instruction}\n"
+        f"請根據以下參考資料回答問題，若找不到答案請誠實說明。\n"
+        f"請用單純的文字回答，不要有格式。\n\n"
+        f"參考資料:\n{chr(10).join(context_snippets)}\n\n"
+        f"問題: {req.message}\n回答:"
+    )
+
+    # === 第四階段: 語言模型生成回答 ===
     result = pipe(prompt, max_new_tokens=3000)[0]['generated_text']
-    answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
+    answer = result.split("回答:")[-1].split("問題:")[0].strip() if "回答:" in result else result.strip()
 
     return {
         "reply": answer,
         "references": reranked_documents,
         "rerank_enabled": cohere_client is not None,
         "faiss_candidates": initial_k,
-        "documents_used": len(reranked_documents)
+        "documents_used": len(reranked_documents),
+        "role": role
     }
+
 
 
 @app.post("/gpt_chat")
