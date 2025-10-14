@@ -20,6 +20,7 @@ import requests
 from dotenv import load_dotenv
 import re  # 新增：用於文字清理
 from groq import Groq  # 新增：Groq API
+import cohere
 
 load_dotenv()
 
@@ -28,9 +29,23 @@ tika.initVM()
 
 local_api = os.getenv("LOCAL_API")
 groq_api_key = os.getenv("GROQ_API_KEY")
+cohere_api_key = os.getenv("COHERE_API_KEY")
 
 # 初始化 Groq 客戶端
 groq_client = Groq(api_key=groq_api_key)
+
+# 初始化 Cohere 客戶端
+if cohere_api_key:
+    try:
+        cohere_client = cohere.Client(cohere_api_key)
+        print("✅ Cohere Rerank 已啟用")
+    except Exception as e:
+        cohere_client = None
+        print(f"⚠️ Cohere 初始化失敗: {e}")
+else:
+    cohere_client = None
+    print("⚠️ COHERE_API_KEY 未設定，Rerank 功能將被停用")
+
 # === Ngrok 設定 ===
 conf.get_default().auth_token = os.getenv("NGROK_TOKEN")
 app = FastAPI()
@@ -393,6 +408,71 @@ def download_file(url: str, local_path: str, timeout: int = 30) -> bool:
         print(f"⚠ 下載檔案時發生錯誤: {e}")
         return False
 
+def rerank_documents(query: str, documents: list, top_k: int = 5):
+    """
+    使用 Cohere Rerank API 對文檔進行重新排序
+    
+    Args:
+        query: 用戶查詢
+        documents: 原始文檔列表（每個元素應該是包含 'text' 鍵的字典）
+        top_k: 返回前 k 個最相關的文檔
+    
+    Returns:
+        重新排序後的文檔列表
+    """
+    if not cohere_client:
+        print("⚠️ Cohere 未初始化，跳過 Rerank，直接返回前 k 個文檔")
+        return documents[:top_k]
+    
+    if not documents:
+        print("⚠️ 沒有文檔需要 Rerank")
+        return []
+    
+    try:
+        print(f"🎯 開始 Rerank，候選文檔數：{len(documents)}，目標返回：{top_k} 個")
+        
+        # 準備文檔文字（Cohere 需要純文字列表）
+        doc_texts = [doc.get('text', '') for doc in documents]
+        
+        # 過濾掉空文檔
+        valid_docs = [(i, doc, text) for i, (doc, text) in enumerate(zip(documents, doc_texts)) if text.strip()]
+        
+        if not valid_docs:
+            print("⚠️ 所有文檔都是空的，無法進行 Rerank")
+            return []
+        
+        valid_indices, valid_documents, valid_texts = zip(*valid_docs)
+        
+        # 呼叫 Cohere Rerank API
+        print(f"📡 呼叫 Cohere Rerank API...")
+        rerank_response = cohere_client.rerank(
+            model="rerank-multilingual-v3.0",  # 支援中文的模型
+            query=query,
+            documents=list(valid_texts),
+            top_n=min(top_k, len(valid_texts)),  # 確保不超過可用文檔數
+            return_documents=False  # 我們已經有原始文檔了
+        )
+        
+        # 根據 Rerank 結果重新排序原始文檔
+        reranked_documents = []
+        for rank, result in enumerate(rerank_response.results):
+            original_index = result.index
+            reranked_doc = valid_documents[original_index].copy()
+            reranked_doc['rerank_score'] = result.relevance_score
+            reranked_doc['rerank_position'] = rank + 1
+            reranked_documents.append(reranked_doc)
+        
+        print(f"✅ Rerank 完成，返回 {len(reranked_documents)} 個文檔")
+        print(f"📊 Rerank 分數範圍：{reranked_documents[0]['rerank_score']:.3f} ~ {reranked_documents[-1]['rerank_score']:.3f}")
+        
+        return reranked_documents
+        
+    except Exception as e:
+        print(f"❌ Rerank 失敗: {e}")
+        print(f"⚠️ 降級為返回原始文檔的前 {top_k} 個")
+        # 如果 Rerank 失敗，返回原始文檔
+        return documents[:top_k]
+
 # === 文字分塊函數（優化版）===
 def chunk_text(text, max_length=400, overlap=50):
     """
@@ -577,15 +657,20 @@ def chat(req: QueryRequest):
     answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
     return {"reply": answer}
 
+
 @app.post("/rag_chat")
 def rag_chat(req: QueryRequest):
     if index is None:
         return {"reply": "⚠ FAISS 索引尚未初始化，請先上傳文件。", "references": []}
-    
+
+    # === 第一階段：FAISS 向量檢索 ===
     query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
-    D, I = index.search(query_vec, 3)
+
+    initial_k = 25  # 先抓 25 個候選文檔
+    D, I = index.search(query_vec, initial_k)
 
     # 列出取得的索引位置與對應的 Mongo _id
+    print(f"🔍 FAISS 檢索：取得 {initial_k} 個候選文檔")
     print("🔍 FAISS 找到的向量 ID 索引：", I)
     top_ids = [paragraph_ids[idx] for idx in I[0] if idx < len(paragraph_ids)]
     print("🧾 FAISS 找到的 MongoDB _id：", top_ids)
@@ -595,24 +680,58 @@ def rag_chat(req: QueryRequest):
 
     # 向本機 API 請求原文
     try:
-        response = requests.post(f"{local_api}/get_docs", json={"ids": top_ids}, timeout=10)
+        api_url = local_api if local_api.startswith('http') else f"https://{local_api}"
+        response = requests.post(f"{api_url}/get_docs", json={"ids": top_ids}, timeout=10)
         documents = response.json()
         if isinstance(documents, dict) and "error" in documents:
             return {"reply": f"⚠ 本機 API 回傳錯誤：{documents['error']}", "references": []}
-        print("📚 取得 documents：", documents)
+        print(f"📚 取得 {len(documents)} 個候選文檔")
     except Exception as e:
         return {"reply": f"⚠ 無法從本機 API 獲取段落：{str(e)}", "references": []}
 
     if not documents:
         return {"reply": "⚠ 沒有找到任何相關段落。", "references": []}
 
-    # 建立 context
-    context_snippets = [doc['text'] for doc in documents]
+    # === 第二階段：Rerank 精選 ===
+    print(f"🎯 開始 Rerank，候選文檔數：{len(documents)}")
+    final_k = 5  # 最終保留 5 個
+    reranked_documents = rerank_documents(req.message, documents, top_k=final_k)
+
+    if not reranked_documents:
+        print("⚠️ Rerank 後沒有文檔，使用原始文檔")
+        reranked_documents = documents[:final_k]
+
+    print(f"✅ 將使用 {len(reranked_documents)} 個文檔生成回答")
+    
+    print("\n" + "="*80)
+    print("📄 Rerank 後採用的文檔：")
+    print("="*80)
+    for i, doc in enumerate(reranked_documents, 1):
+        rerank_score = doc.get('rerank_score', 'N/A')
+        source = doc.get('source', 'unknown')
+        text_preview = doc.get('text', '')[:150]  # 只顯示前 150 個字
+
+        print(f"\n【文檔 {i}】")
+        print(f"  Rerank 分數：{rerank_score}")
+        print(f"  來源：{source}")
+        print(f"  內容預覽：{text_preview}...")
+        print(f"  完整長度：{len(doc.get('text', ''))} 字元")
+    print("="*80 + "\n")
+
+    # === 第三階段：建立 context 並生成回答 ===
+    context_snippets = [doc['text'] for doc in reranked_documents]
     prompt = f"你是一位 ESG 永續報告分析師，請根據以下參考資料回答問題，若找不到答案請誠實說明。此外，請用單純的文字回答，不要有格式。\n\n參考資料：\n{chr(10).join(context_snippets)}\n\n問題：{req.message}\n回答："
     result = pipe(prompt, max_new_tokens=3000)[0]['generated_text']
     answer = result.split("回答：")[-1].split("問題：")[0].strip() if "回答：" in result else result.strip()
 
-    return {"reply": answer, "references": documents}
+    return {
+        "reply": answer,
+        "references": reranked_documents,
+        "rerank_enabled": cohere_client is not None,
+        "faiss_candidates": initial_k,
+        "documents_used": len(reranked_documents)
+    }
+
 
 @app.post("/gpt_chat")
 def gpt_chat(req: QueryRequest):
@@ -655,10 +774,11 @@ def gpt_chat(req: QueryRequest):
         return {"error": f"⚠ Groq API 調用失敗：{str(e)}"}
 
 
+
 @app.post("/gpt_rag_chat")
-def gpt_chat(req: QueryRequest):
+def gpt_rag_chat(req: QueryRequest):  # ← 注意函數名稱
     """
-    使用 RAG 檢索相關文件，然後透過 Groq API 回答問題
+    使用 RAG 檢索相關文件，然後透過 Groq API 回答問題（含 Rerank）
     """
     # 檢查 Groq API Key
     if not groq_api_key:
@@ -671,9 +791,15 @@ def gpt_chat(req: QueryRequest):
     try:
         # === RAG 檢索階段 ===
         query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
-        D, I = index.search(query_vec, 5)  # 獲取更多相關文檔
-
+        
+        # 🔍 第一階段：FAISS 向量檢索（快速但不夠精準）
+        # 先取更多候選文檔，之後用 Rerank 精選
+        initial_k = 25  # 候選文檔數量
+        D, I = index.search(query_vec, initial_k)
+        
+        print(f"🔍 FAISS 檢索：取得 {initial_k} 個候選文檔")
         print("🔍 FAISS 找到的向量 ID 索引：", I)
+        
         top_ids = [paragraph_ids[idx] for idx in I[0] if idx < len(paragraph_ids)]
         print("🧾 FAISS 找到的 MongoDB _id：", top_ids)
 
@@ -701,7 +827,12 @@ def gpt_chat(req: QueryRequest):
                 )
                 
                 answer = completion.choices[0].message.content
-                return {"reply": answer, "references": [], "note": "基於一般知識回答（未找到相關文檔）"}
+                return {
+                    "reply": answer, 
+                    "references": [], 
+                    "note": "基於一般知識回答（未找到相關文檔）",
+                    "rerank_enabled": False
+                }
             
             except Exception as e:
                 return {"error": f"⚠ Groq API 調用失敗：{str(e)}", "references": []}
@@ -715,7 +846,7 @@ def gpt_chat(req: QueryRequest):
             if isinstance(documents, dict) and "error" in documents:
                 return {"reply": f"⚠ 本機 API 回傳錯誤：{documents['error']}", "references": []}
             
-            print("📚 取得 documents：", len(documents))
+            print(f"📚 取得 {len(documents)} 個候選文檔")
             
         except Exception as e:
             return {"error": f"⚠ 無法從本機 API 獲取段落：{str(e)}", "references": []}
@@ -723,13 +854,40 @@ def gpt_chat(req: QueryRequest):
         if not documents:
             return {"error": "⚠ 沒有找到任何相關段落。", "references": []}
 
+        # 🎯 第二階段：Rerank（精準排序）
+        print(f"🎯 開始 Rerank，候選文檔數：{len(documents)}")
+        final_k = 5  # 最終要使用的文檔數量
+        reranked_documents = rerank_documents(req.message, documents, top_k=final_k)
+        
+        if not reranked_documents:
+            print("⚠️ Rerank 後沒有文檔，使用原始文檔")
+            reranked_documents = documents[:final_k]
+        
+        print(f"✅ 將使用 {len(reranked_documents)} 個文檔生成回答")
+
+        print("\n" + "="*80)
+        print("📄 Rerank 後採用的文檔：")
+        print("="*80)
+        for i, doc in enumerate(reranked_documents, 1):
+            rerank_score = doc.get('rerank_score', 'N/A')
+            source = doc.get('source', 'unknown')
+            text_preview = doc.get('text', '')[:150]  # 只顯示前 150 個字
+    
+            print(f"\n【文檔 {i}】")
+            print(f"  Rerank 分數：{rerank_score}")
+            print(f"  來源：{source}")
+            print(f"  內容預覽：{text_preview}...")
+            print(f"  完整長度：{len(doc.get('text', ''))} 字元")
+        print("="*80 + "\n")
+        
         # === 準備上下文並呼叫 Groq API ===
-        context_snippets = [doc['text'] for doc in documents]
+        context_snippets = [doc['text'] for doc in reranked_documents]
         context_text = "\n\n".join(context_snippets)
         
         # 限制上下文長度避免超過 token 限制
-        if len(context_text) > 4000:  # 預留給問題和系統提示的空間
+        if len(context_text) > 4000:
             context_text = context_text[:4000] + "..."
+            print(f"⚠️ 上下文過長，已截斷至 4000 字元")
         
         try:
             completion = groq_client.chat.completions.create(
@@ -768,16 +926,21 @@ def gpt_chat(req: QueryRequest):
             
             return {
                 "reply": answer,
-                "references": documents,
-                "note": "基於文檔內容 + Groq GPT 回答"
+                "references": reranked_documents,
+                "note": "基於文檔內容 + Rerank + Groq GPT 回答",
+                "rerank_enabled": cohere_client is not None,
+                "documents_used": len(reranked_documents)
             }
             
         except Exception as e:
-            return {"error": f"⚠ Groq API 調用失敗：{str(e)}", "references": documents}
+            return {"error": f"⚠ Groq API 調用失敗：{str(e)}", "references": reranked_documents}
     
     except Exception as e:
-        print(f"gpt_chat 發生錯誤: {e}")
+        print(f"gpt_rag_chat 發生錯誤: {e}")
+        import traceback
+        print(f"📋 詳細錯誤: {traceback.format_exc()}")
         return {"error": f"⚠ 處理請求時發生錯誤：{str(e)}", "references": []}
+
 
 # === 上傳端點（原有的檔案上傳功能）===
 @app.post("/upload-document")
@@ -787,7 +950,7 @@ async def upload_document(file: UploadFile = File(...)):
     upload_dir = "./upload"
     os.makedirs(upload_dir, exist_ok=True)
     file_path = os.path.join(upload_dir, file.filename)
-    
+   
     try:
         with open(file_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
