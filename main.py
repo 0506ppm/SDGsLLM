@@ -665,6 +665,10 @@ def rag_chat(req: QueryRequest):
 
     # === 取得使用者角色 ===
     role = getattr(req, "role", None)
+    mes = getattr(req, "message", None)
+    print("role" : {role})
+    print("問題" : {message})
+
     if not role:
         role = "外部人士"
         print("⚠ 沒收到前端角色資訊，預設為外部人士。")
