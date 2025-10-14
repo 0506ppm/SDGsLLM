@@ -661,20 +661,22 @@ def chat(req: QueryRequest):
 @app.post("/rag_chat")
 def rag_chat(req: QueryRequest):
     if index is None:
-        return {"reply": "⚠ FAISS 索引尚未初始化,請先上傳文件。", "references": []}
+        return {"reply": "⚠ FAISS 索引尚未初始化，請先上傳文件。", "references": []}
 
     # === 取得使用者角色 ===
-    role = getattr(req, "role", None) or "外部人士"  # 預設為外部人士
-    print(f"👤 使用者角色: {role}")
+    role = getattr(req, "role", None)
+    if not role:
+        role = "外部人士"
+        print("⚠ 沒收到前端角色資訊，預設為外部人士。")
+    else:
+        print(f"👤 使用者角色: {role}")
 
     # === 第一階段: FAISS 向量檢索 ===
     query_vec = embedding_model.get_embedding(req.message, device).cpu().numpy()
-
-    initial_k = 25  # 先抓 25 個候選文檔
+    initial_k = 25
     D, I = index.search(query_vec, initial_k)
 
-    print(f"🔍 FAISS 檢索:取得 {initial_k} 個候選文檔")
-    print("🔍 FAISS 找到的向量 ID 索引:", I)
+    print(f"🔍 FAISS 檢索: 取得 {initial_k} 個候選文檔")
     top_ids = [paragraph_ids[idx] for idx in I[0] if idx < len(paragraph_ids)]
     print("🧾 FAISS 找到的 MongoDB _id:", top_ids)
 
@@ -700,14 +702,30 @@ def rag_chat(req: QueryRequest):
     final_k = 5
     reranked_documents = rerank_documents(req.message, documents, top_k=final_k)
 
-    if not reranked_documents:
-        print("⚠️ Rerank 後沒有文檔,使用原始文檔")
-        reranked_documents = documents[:final_k]
+    # === 信心門檻過濾 ===
+    confidence_threshold = 0.8
+    filtered_docs = [
+        doc for doc in reranked_documents
+        if isinstance(doc.get("rerank_score"), (int, float)) and doc["rerank_score"] >= confidence_threshold
+    ]
 
-    print(f"✅ 將使用 {len(reranked_documents)} 個文檔生成回答")
+    if not filtered_docs:
+        print(f"⚠ 所有文檔信心分數都低於 {confidence_threshold}，不生成回答。")
+        return {
+            "reply": "⚠ 找不到足夠信心的資料，請嘗試詢問其他問題。",
+            "references": [],
+            "rerank_enabled": cohere_client is not None,
+            "faiss_candidates": initial_k,
+            "documents_used": 0,
+            "role": role,
+            "confidence_threshold": confidence_threshold
+        }
+
+    print(f"✅ 通過信心門檻的文檔數: {len(filtered_docs)} / {len(reranked_documents)}")
+    reranked_documents = filtered_docs
 
     print("\n" + "="*80)
-    print("📄 Rerank 後採用的文檔:")
+    print("📄 通過信心門檻的文檔:")
     print("="*80)
     for i, doc in enumerate(reranked_documents, 1):
         rerank_score = doc.get('rerank_score', 'N/A')
@@ -717,7 +735,6 @@ def rag_chat(req: QueryRequest):
         print(f"  Rerank 分數: {rerank_score}")
         print(f"  來源: {source}")
         print(f"  內容預覽: {text_preview}...")
-        print(f"  完整長度: {len(doc.get('text', ''))} 字元")
     print("="*80 + "\n")
 
     # === 第三階段: 建立 prompt ===
@@ -746,8 +763,10 @@ def rag_chat(req: QueryRequest):
         "rerank_enabled": cohere_client is not None,
         "faiss_candidates": initial_k,
         "documents_used": len(reranked_documents),
-        "role": role
+        "role": role,
+        "confidence_threshold": confidence_threshold
     }
+
 
 
 
