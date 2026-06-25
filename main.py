@@ -123,6 +123,7 @@ else:
 # === Pydantic 模型定義 ===
 class QueryRequest(BaseModel):
     message: str
+    role: str
 
 class UploadDocumentRequest(BaseModel):
     file_url: str
